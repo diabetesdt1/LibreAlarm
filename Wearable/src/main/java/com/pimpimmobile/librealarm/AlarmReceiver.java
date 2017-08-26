@@ -6,10 +6,13 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.support.v4.content.WakefulBroadcastReceiver;
 import android.util.Log;
+
+import com.pimpimmobile.librealarm.shareddata.PreferencesUtil;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -19,7 +22,7 @@ import java.util.Date;
  */
 public class AlarmReceiver extends WakefulBroadcastReceiver {
 
-    private static final String TAG = "GLUCOSE::" + AlarmReceiver.class.getSimpleName();
+    private static final String TAG = "LibreAlarm" + AlarmReceiver.class.getSimpleName();
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -29,15 +32,40 @@ public class AlarmReceiver extends WakefulBroadcastReceiver {
         startWakefulService(context, i);
     }
 
+    public static long getNextPeriodDelay(Context context, boolean halfspeed) {
+        long period_ms;
+        try {
+            period_ms = Integer.valueOf(PreferencesUtil.getCheckGlucoseInterval(context)) * 60000;
+            if (halfspeed) {
+                period_ms = period_ms * 2;
+                Log.d(TAG, "Going half speed at: " + period_ms);
+            }
+        } catch (Exception e) {
+            period_ms = 5 * 60000;
+        }
+
+        period_ms = Math.max(60000, period_ms);
+        final long now = JoH.tsl();
+        final long timestamp_next = (((now + (5 * 1000)) / period_ms) * period_ms) + period_ms;
+        final long delay = Math.max((timestamp_next - now) - (5 * 1000), 14999);
+        return delay;
+    }
+
     public static void post(Context context, long delay) {
         Log.i(TAG, "set next check: " + delay + " (" + new SimpleDateFormat("HH:mm:ss")
                 .format(new Date(delay + System.currentTimeMillis())) + ") "
                 + new Exception().getStackTrace()[1]);
-        AlarmManager alarmManager = (AlarmManager)context.getSystemService(Context.ALARM_SERVICE);
-        PendingIntent intent = getAlarmReceiverIntent(context);
+        final AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        final PendingIntent intent = getAlarmReceiverIntent(context);
         alarmManager.cancel(intent);
-        alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + delay, intent);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + delay, intent);
+        } else {
+            alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + delay, intent);
+        }
         PreferenceManager.getDefaultSharedPreferences(context).edit()
                 .putLong("next_check", System.currentTimeMillis() + delay).apply();
     }
@@ -56,7 +84,7 @@ public class AlarmReceiver extends WakefulBroadcastReceiver {
 
     private static PendingIntent getAlarmReceiverIntent(Context context) {
         Intent intent = new Intent(context, AlarmReceiver.class);
-        return PendingIntent.getBroadcast(context, 0, intent, 0);
+        return PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
     public static void stop(Context context) {

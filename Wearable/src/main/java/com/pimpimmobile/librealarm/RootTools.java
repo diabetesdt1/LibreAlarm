@@ -1,9 +1,8 @@
 package com.pimpimmobile.librealarm;
 
 import android.content.Context;
-import android.os.Handler;
-import android.os.HandlerThread;
-import android.os.Message;
+import android.nfc.NfcAdapter;
+import android.nfc.NfcManager;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -17,45 +16,49 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.Charset;
 
-public class RootTools {
+class RootTools {
 
-    private static final String TAG = "GLUCOSE::" + RootTools.class.getSimpleName();
+    private static final String TAG = "LibreAlarm" + RootTools.class.getSimpleName();
     private static final boolean DEBUG = AlgorithmUtil.DEBUG;
 
     private static Boolean sHasRoot = null;
     private static boolean sScriptsCreated = false;
+    private static boolean mNfcDestinationState = false;
 
-    private Context mContext;
 
-    private PowerManager.WakeLock mWakeLock;
+    private static PowerManager.WakeLock mWakeLock;
 
-    private RootHandlerThread mRootHandlerThread;
 
-    public RootTools(Context context) {
-        mContext = context;
-        createScripts();
-        if (isHasRoot()) mRootHandlerThread = new RootHandlerThread();
-    }
-
-    public synchronized boolean isHasRoot() {
-        if (sHasRoot == null) sHasRoot = (new File("/system/xbin/su").exists());
+    public static synchronized boolean isHasRoot() {
+        if (sHasRoot == null) {
+            sHasRoot = (new File("/system/xbin/su").exists());
+        }
         return sHasRoot;
     }
 
-    private void createScripts() {
+    private static synchronized void createScripts() {
         if (sScriptsCreated) return;
         // switches to lowest possible power levels on cpu
-        String script_name = mContext.getFilesDir()+"/powersave.sh";
-        writeToFile(script_name,"echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\necho 0 >/sys/devices/system/cpu/cpu1/online\n");
+        final File file_dir = libreAlarm.getAppContext().getFilesDir();
+        if (!file_dir.exists()) {
+            Log.d(TAG, "Creating folder for: " + file_dir);
+            file_dir.mkdirs();
+        }
+
+        String script_name = file_dir + "/powersave.sh";
+        writeToFile(script_name, "echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\necho 0 >/sys/devices/system/cpu/cpu1/online\n");
+        //writeToFile(script_name, "echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\n\n");
 
         // restore cpu speed somewhat
-        script_name = mContext.getFilesDir()+"/performance.sh";
-        writeToFile(script_name,"echo interactive > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\necho 1 >/sys/devices/system/cpu/cpu1/online\n");
+        script_name = file_dir + "/performance.sh";
+        // seems to crash sometimes waking up the second cpu so lets not do that
+        //writeToFile(script_name, "echo interactive > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\necho 1 >/sys/devices/system/cpu/cpu1/online\n");
+        writeToFile(script_name, "echo interactive > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\n\n");
 
 
         // disables the touch sense on the keypad by nuking the driver
-        script_name = mContext.getFilesDir()+"/killtouch.sh";
-        writeToFile(script_name,"echo synaptics_dsx.0 >/sys/bus/platform/drivers/synaptics_dsx/unbind\n" +
+        script_name = file_dir + "/killtouch.sh";
+        writeToFile(script_name, "echo synaptics_dsx.0 >/sys/bus/platform/drivers/synaptics_dsx/unbind\n" +
                 "a=`grep -l ^/system/bin/key_sleep_vibrate_service /proc/*/cmdline`\n" +
                 "if [ \"$a\" != \"\" ]\n" +
                 "then\n" +
@@ -69,12 +72,20 @@ public class RootTools {
                 "echo \"$b\"\n" +
                 "kill \"$b\"\n" +
                 "fi\n" +
+                "setprop ctl.stop key_vibrate\n" +
+                "setprop ctl.stop gpsd\n\n" +
                 "\n");
+
+        // removes xdrip watchface if present
+        script_name = file_dir + "/uninstallxdrip.sh";
+        writeToFile(script_name, "pm uninstall com.eveningoutpost.xdrip\n" +
+                "\n");
+
 
         sScriptsCreated = true;
     }
 
-    private void writeToFile(String filename, String data) {
+    private static void writeToFile(String filename, String data) {
         try {
             File the_file = new File(filename);
             // if (!the_file.exists())
@@ -88,113 +99,163 @@ public class RootTools {
         }
     }
 
-    public void executeScripts(boolean state) {
-        executeScripts(state,0);
+    public static void executeScripts(boolean state) {
+        executeScripts(state, 0);
     }
 
     // platform specific method for enabling/disabling nfc - not sure if there is a better api based method
-    public void executeScripts(final boolean state, final long delay) {
+    public static void executeScripts(final boolean state, final long delay) {
         if (!isHasRoot()) return;
-        mRootHandlerThread.executeScripts(state, delay);
-        final PowerManager pm = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
-        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Nfc-control");
-        mWakeLock.acquire(30000);
-    }
-
-    public void cancelScripts() {
-        if (!isHasRoot()) return;
-        mRootHandlerThread.mHandler.removeCallbacksAndMessages(null);
-        if (mWakeLock.isHeld()) mWakeLock.release();
-    }
-
-    private static String showProcessOutput(Process execute)
-    {
-        try {
-            execute.waitFor();
-            if (DEBUG) Log.d(TAG, "PROCESS OUTPUT: " + (new BufferedReader(new InputStreamReader(execute.getInputStream())).readLine()));
-            String error = (new BufferedReader(new InputStreamReader(execute.getErrorStream())).readLine());
-            if (DEBUG) Log.d(TAG, " PROCESS ERROR: " + error);
-            return error;
-        } catch (InterruptedException | IOException e) {
-            Log.d(TAG, "Got error showing process output: "+e.toString());
-        }
-        return "other error";
-    }
-
-    private class RootHandlerThread extends HandlerThread implements Handler.Callback {
-        private Handler mHandler;
-
-        private boolean mNfcDestinationState = false;
-
-        private RootHandlerThread() {
-            super("RootHandlerThread");
-            start();
-            mHandler = new Handler(getLooper(), this);
-        }
-
-        // platform specific method for enabling/disabling nfc - not sure if there is a better api based method
-        private void executeScripts(final boolean state, final long delay) {
-            Message message = new Message();
-            message.what = state ? 1 : 0;
-            if (delay > 0) {
-                mHandler.sendMessageDelayed(message, delay);
-            } else {
-                mHandler.sendMessage(message);
+        createScripts();
+        if (delay > 0) {
+            JoH.runOnUiThreadDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    new Thread() {
+                        @Override
+                        public void run() {
+                            runRootScripts(state);
+                        }
+                    }.start();
+                }
+            }, delay);
+        } else {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    runRootScripts(state);
+                }
             }
+            ).start();
         }
+    }
 
-        @Override
-        public boolean handleMessage(Message msg) {
-            boolean state = msg.what == 1;
+    private static synchronized void runRootScripts(boolean state) {
+        if ((mWakeLock != null) && (mWakeLock.isHeld())) mWakeLock.release();
+        mWakeLock = JoH.getWakeLock("run-root-scripts", 30000);
+        final Context mContext = libreAlarm.getAppContext();
+        try {
+            if (mNfcDestinationState == state) {
+                Log.e(TAG, "Destination state changed from: " + state + " to " + mNfcDestinationState + " .. skipping switch!");
+            } else {
+                //final boolean needs_root = true; // unclear at the moment whether we need root for this
 
-            try {
-                if (mNfcDestinationState == state) {
-                    Log.e(TAG,"Destination state changed from: "+state+" to "+ mNfcDestinationState +" .. skipping switch!");
-                } else {
-                    //final boolean needs_root = true; // unclear at the moment whether we need root for this
-
-                    if (state) {
-                        if (DEBUG) Log.d(TAG,"Switching to higher performance cpu speed");
-                        final Process execute4 = Runtime.getRuntime().exec("su -c sh "+mContext.getFilesDir()+"/performance.sh");
+                /*if (state) {
+                    if (JoH.quietratelimit("speedup-cpu", PreferencesUtil.slowCpu(mContext) ? 1 : 3600)) {
+                        if (DEBUG) Log.d(TAG, "Switching to higher performance cpu speed");
+                        final Process execute4 = Runtime.getRuntime().exec("su -c sh " + mContext.getFilesDir() + "/performance.sh");
                     }
+                }*/
 
-                    for (int counter=0 ;counter < 5 ;counter++) {
-                        Log.i(TAG, "Trying to switch nfc " + (state ? "on" : "off"));
-                        final Process execute = Runtime.getRuntime().exec("su -c service call nfc " + (state ? "6" : "5")); // turn NFC on or off
-                        if (showProcessOutput(execute) != null) {
-                            Log.e(TAG, "Got error- retrying.."+counter);
+                if (state || PreferencesUtil.toggleNFC(mContext)) {
+                    final NfcManager nfcManager =
+                            (NfcManager) libreAlarm.getAppContext().getSystemService(Context.NFC_SERVICE);
+                    final NfcAdapter mNfcAdapter = nfcManager.getDefaultAdapter(); // could be static?
+                    if (mNfcAdapter != null) {
+                        if (mNfcAdapter.isEnabled() != state) {
+                            for (int counter = 0; counter < 5; counter++) {
+                                Log.i(TAG, "Trying to switch nfc " + (state ? "on" : "off"));
+                                // static version of this is duplicated below
+                                final Process execute = Runtime.getRuntime().exec("su -c service call nfc " + (state ? "6" : "5")); // turn NFC on or off
+                                if (showProcessOutput(execute) != null) {
+                                    Log.e(TAG, "Got error- retrying.." + counter);
+                                } else {
+                                    break;
+                                }
+                            }
                         } else {
-                            break;
+                            Log.d(TAG, "Nfc adapter is already in desired state of: " + (state ? "on" : "off"));
+                        }
+                    } else {
+                        Log.e(TAG, "No NFC adapter found!!");
+                    }
+                }
+
+                if (!state) {
+                    if (PreferencesUtil.automaticallyEnableTheatreMode(mContext)) {
+                        if (JoH.quietratelimit("enable-theatre-mode", 3600)) {
+                            enterTheatreMode();
                         }
                     }
 
-                    if (!state) {
-                        if (PreferencesUtil.disableTouchscreen(mContext)) {
-                            // TODO check if already disabled
+                    if (PreferencesUtil.disableTouchscreen(mContext)) {
+                        // TODO check if already disabled
+                        if (JoH.quietratelimit("disable-touchscreen", 7200)) {
                             if (DEBUG) Log.d(TAG, "Disabling touchscreen!");
                             final Process execute1 = Runtime.getRuntime().exec("su -c sh " + mContext.getFilesDir() + "/killtouch.sh");
                             if (DEBUG) showProcessOutput(execute1);
                         }
-                        if (PreferencesUtil.slowCpu(mContext)) {
-                            if (DEBUG) Log.d(TAG, "Switching to lower powersave cpu speed");
-                            final Process execute2 = Runtime.getRuntime().exec("su -c sh " + mContext.getFilesDir() + "/powersave.sh");
-                            if (DEBUG) showProcessOutput(execute2);
+                    }
+
+                    if ((WearActivity.got_tag_data) && (PreferencesUtil.uninstallxDrip(mContext))) {
+                        if (JoH.quietratelimit("uninstall-xdrip", 60000)) {
+                            Log.d(TAG, "Attempting to uninstall xdrip");
+                            final Process execute1 = Runtime.getRuntime().exec("su -c sh " + mContext.getFilesDir() + "/uninstallxdrip.sh");
+                            if (DEBUG) showProcessOutput(execute1);
                         }
                     }
-                }
 
-            } catch (Exception e) {
-                Log.e(TAG, "Got exception executing root nfc off: "+e.toString());
-            } finally {
-                if (mWakeLock.isHeld()) mWakeLock.release();
+                    if (PreferencesUtil.slowCpu(mContext)) {
+                        if (DEBUG) Log.d(TAG, "Switching to lower powersave cpu speed");
+                        final Process execute2 = Runtime.getRuntime().exec("su -c sh " + mContext.getFilesDir() + "/powersave.sh");
+                        if (DEBUG) showProcessOutput(execute2);
+                    }
+                }
             }
 
-            if (!state) quitSafely();
-
-            mNfcDestinationState = state;
-
-            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Got exception executing root nfc off: " + e.toString());
+        } finally {
+            if (mWakeLock.isHeld()) mWakeLock.release();
         }
+        mNfcDestinationState = state;
+    }
+
+
+    private static String showProcessOutput(Process execute) {
+        try {
+            execute.waitFor();
+            if (DEBUG)
+                Log.d(TAG, "PROCESS OUTPUT: " + (new BufferedReader(new InputStreamReader(execute.getInputStream())).readLine()));
+            String error = (new BufferedReader(new InputStreamReader(execute.getErrorStream())).readLine());
+            if (DEBUG) Log.d(TAG, " PROCESS ERROR: " + error);
+            return error;
+        } catch (InterruptedException | IOException e) {
+            Log.d(TAG, "Got error showing process output: " + e.toString());
+        }
+        return "other error";
+    }
+
+    public static Process enterTheatreMode() {
+        // Thanks to Alan Haverty for the idea and implementation of how to do this
+        try {
+            if (DEBUG) Log.d(TAG, "Enabling theatre mode");
+            final Process executeTheatreMode = Runtime.getRuntime().exec("su -c settings put global theater_mode_on 1");
+            if (DEBUG) showProcessOutput(executeTheatreMode);
+        } catch (Exception e) {
+            Log.e(TAG, "Got exception changing theatre state: " + e);
+        }
+        return null;
+    }
+
+    public static Process swichNFCState(boolean state) {
+        Log.i(TAG, "Trying to switch nfc " + (state ? "on" : "off"));
+        try {
+            return Runtime.getRuntime().exec("su -c service call nfc " + (state ? "6" : "5"));
+        } catch (Exception e) {
+            Log.e(TAG, "Got exception changing nfc state: " + e);
+        }
+        return null;
+    }
+
+    public static Process reboot() {
+        Log.i(TAG, "Trying to reboot");
+        try {
+            return Runtime.getRuntime().exec("su -c svc power reboot");
+        } catch (Exception e) {
+            Log.e(TAG, "Got exception trying reboot " + e);
+        }
+        return null;
     }
 
 }

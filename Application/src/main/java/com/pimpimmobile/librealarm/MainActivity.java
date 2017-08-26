@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.Fragment;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -11,13 +14,19 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.preference.PreferenceManager;
+import android.provider.Settings;
+import android.support.v4.app.NotificationCompat;
 import android.support.v4.widget.DrawerLayout;
 import android.support.v7.app.ActionBarDrawerToggle;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuInflater;
@@ -33,7 +42,6 @@ import com.pimpimmobile.librealarm.nightscout.NightscoutPreferences;
 import com.pimpimmobile.librealarm.quicksettings.QuickSettingsItem;
 import com.pimpimmobile.librealarm.quicksettings.QuickSettingsView;
 import com.pimpimmobile.librealarm.quicksettings.QuickSettingsView.QuickSettingsChangeListener;
-import com.pimpimmobile.librealarm.shareddata.AlgorithmUtil;
 import com.pimpimmobile.librealarm.shareddata.GlucoseData;
 import com.pimpimmobile.librealarm.shareddata.PredictionData;
 import com.pimpimmobile.librealarm.shareddata.PreferencesUtil;
@@ -45,16 +53,23 @@ import com.pimpimmobile.librealarm.xdrip_plus.XdripPlusPreferences;
 import java.util.Date;
 import java.util.HashMap;
 
+import static com.pimpimmobile.librealarm.R.string.sensor_error;
+import static com.pimpimmobile.librealarm.shareddata.AlgorithmUtil.CONFIDENCE_LIMIT;
+import static com.pimpimmobile.librealarm.shareddata.AlgorithmUtil.format;
+import static com.pimpimmobile.librealarm.shareddata.Status.Type.ALARM_HIGH;
+import static com.pimpimmobile.librealarm.shareddata.Status.Type.ALARM_LOW;
+
 public class MainActivity extends Activity implements WearService.WearServiceListener,
         SimpleDatabase.DatabaseListener, HistoryAdapter.OnListItemClickedListener,
         AlarmDialogFragment.AlarmActionListener, QuickSettingsChangeListener {
 
-    private static final String TAG = "GLUCOSE::" + MainActivity.class.getSimpleName();
+    private static final String TAG = "LibreAlarm" + MainActivity.class.getSimpleName();
 
     private static final String INTENT_ALARM_ACTION = "alarm";
 
     private View mTriggerGlucoseButton;
     private TextView mStatusTextView;
+    private TextView mStatsTextView;
     private HistoryAdapter mAdapter;
     private Button mActionButton;
     private ActionBarDrawerToggle mDrawerToggle;
@@ -67,9 +82,12 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
     private View mSnoozeHighParent;
     private boolean mIsFirstStartup;
 
+    public static boolean activityVisible = false;
+
     private ServiceConnection mConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
+            Log.d(TAG,"Local Service connected!");
             mService = ((WearService.WearServiceBinder) service).getService();
             mService.setListener(MainActivity.this, MainActivity.this);
             onDataUpdated();
@@ -117,6 +135,7 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
         getActionBar().setHomeButtonEnabled(true);
 
         mStatusTextView = (TextView) layout.findViewById(R.id.status_view);
+        mStatsTextView = (TextView) layout.findViewById(R.id.stats_view);
         if (PreferenceManager.getDefaultSharedPreferences(this).getBoolean("first_startup", true)) {
             showDisclaimer(true);
             mIsFirstStartup = true;
@@ -127,7 +146,9 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
             public void onDrawerClosed(View drawerView) {
                 HashMap<String, String> savedSettings = mQuickSettings.saveSettings();
                 if (savedSettings.size() > 0) {
+                    WearService.pushSettingsNow();
                     mService.sendData(WearableApi.SETTINGS, savedSettings, null);
+
                 }
                 super.onDrawerClosed(drawerView);
             }
@@ -261,7 +282,34 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
     @Override
     protected void onResume() {
         super.onResume();
+        activityVisible = true;
         if (mService != null) onDataUpdated();
+        if (JoH.ratelimit("battery-optimize", 5)) {
+            checkBatteryOptimization();
+        }
+    }
+
+    private void checkBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            final String packageName = getPackageName();
+            //Log.d(TAG, "Maybe ignoring battery optimization");
+            final PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                Log.d(TAG, "Requesting ignore battery optimization");
+                try {
+                    final Intent intent = new Intent();
+                    // ignoring battery optimizations required for constant connection
+                    // to peripheral device - eg CGM transmitter.
+                    intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(Uri.parse("package:" + packageName));
+                    startActivity(intent);
+                } catch (ActivityNotFoundException e) {
+                    final String msg = "Device does not appear to support battery optimization whitelisting!";
+                    JoH.static_toast_short(msg);
+                    Log.wtf(TAG, msg);
+                }
+            }
+        }
     }
 
     @Override
@@ -277,6 +325,11 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
         // Sync the toggle state after onRestoreInstanceState has occurred.
         mDrawerToggle.syncState();
     }
+    @Override
+    public void onPause() {
+        super.onPause();
+        activityVisible = false;
+    }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -287,8 +340,16 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
             for (String key : bundle.keySet()) {
                 settingsUpdated.put(key, bundle.getString(key));
             }
-            if (settingsUpdated.containsKey(getString(R.string.pref_key_mmol))) mQuickSettings.refresh();
-            if (settingsUpdated.size() > 0) mService.sendData(WearableApi.SETTINGS, settingsUpdated, null);
+            if (settingsUpdated.containsKey(getString(R.string.pref_key_mmol)))
+                mQuickSettings.refresh();
+            if (settingsUpdated.size() > 0) {
+                if (mService != null) {
+                    WearService.pushSettingsNow();
+                    mService.sendData(WearableApi.SETTINGS, settingsUpdated, null);
+                } else {
+                    Log.wtf(TAG, "mService was null when settings were updated");
+                }
+            }
         }
         super.onActivityResult(requestCode, resultCode, data);
     }
@@ -298,19 +359,37 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
         if (mDrawerToggle.onOptionsItemSelected(item)) {
             return true;
         }
-        if (item.getItemId() == R.id.disclaimer) {
+        final int id = item.getItemId();
+        if (id == R.id.disclaimer) {
             showDisclaimer(false);
-        }
-        if (item.getItemId() == R.id.nightscout) {
+        } else if (id == R.id.nightscout) {
             startActivity(new Intent(this, NightscoutPreferences.class));
-        }
-        if (item.getItemId() == R.id.xdrip_plus) {
-            startActivityForResult(new Intent(this, XdripPlusPreferences.class),0);
-        }
-        if (item.getItemId() == R.id.preferences) {
+        } else if (id == R.id.xdrip_plus) {
+            startActivityForResult(new Intent(this, XdripPlusPreferences.class), 0);
+        } else if (id == R.id.preferences) {
             startActivityForResult(new Intent(this, Preferences.class), 0);
+        } else if (id == R.id.reboot) {
+            rebootWatch();
+        } else if (id == R.id.clearstats) {
+            clearStats();
+        } else if (id == R.id.downloadxdripplus) {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://xdrip-plus-updates.appspot.com/stable/xdrip-plus-latest.apk")));
         }
         return super.onOptionsItemSelected(item);
+    }
+
+    private void rebootWatch() {
+        if (mService != null) {
+            mService.reboot();
+            JoH.static_toast_long(this, getString(R.string.reboot_command));
+        }
+    }
+
+    private void clearStats() {
+        if (mService != null) {
+            mService.clearstats();
+            JoH.static_toast_long(this, getString(R.string.clear_stats_command));
+        }
     }
 
     public boolean onCreateOptionsMenu(Menu menu) {
@@ -328,52 +407,74 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
 
     @Override
     public void onDataUpdated() {
-        onDatabaseChange();
-        Status status = mService.getReadingStatus();
-        mProgressBar.setVisibility((status != null && status.status == Type.ATTEMPTING) ? View.VISIBLE : View.GONE);
-        if (status != null && mService.isConnected()) {
-            switch (status.status) {
-                case ALARM_HIGH:
-                case ALARM_LOW:
-                case ALARM_OTHER:
-                    mActionButton.setText(R.string.button_alarm);
-                    mActionButton.setVisibility(View.VISIBLE);
+        final Context context = this;
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                onDatabaseChange();
+                Status status = mService.getReadingStatus();
+                mProgressBar.setVisibility((status != null && status.status == Type.ATTEMPTING) ? View.VISIBLE : View.GONE);
+                if (status != null && mService.isConnected()) {
+                    switch (status.status) {
+                        case ALARM_HIGH:
+                        case ALARM_LOW:
+                        case ALARM_OTHER:
+                            mActionButton.setText(R.string.button_alarm);
+                            mActionButton.setVisibility(View.VISIBLE);
+                            mTriggerGlucoseButton.setVisibility(View.GONE);
+                            break;
+                        case ATTEMPTING:
+                        case ATTENPT_FAILED:
+                        case WAITING:
+                            if (!PreferencesUtil.getIsStartedPhone(getApplicationContext())) {
+                                Log.e(TAG, "Marking as started when previously wasn't");
+                                PreferencesUtil.setIsStartedPhone(getApplicationContext(), true);
+                            }
+                            mActionButton.setText(R.string.button_stop);
+                            mActionButton.setVisibility(View.VISIBLE);
+                            mTriggerGlucoseButton.setVisibility(View.VISIBLE);
+                            break;
+                        case NOT_RUNNING:
+                            mActionButton.setText(R.string.button_start);
+                            mActionButton.setVisibility(View.VISIBLE);
+                            mTriggerGlucoseButton.setVisibility(View.GONE);
+                            break;
+                    }
+                } else {
+                    mActionButton.setVisibility(View.GONE);
                     mTriggerGlucoseButton.setVisibility(View.GONE);
-                    break;
-                case ATTEMPTING:
-                case ATTENPT_FAILED:
-                case WAITING:
-                    mActionButton.setText(R.string.button_stop);
-                    mActionButton.setVisibility(View.VISIBLE);
-                    mTriggerGlucoseButton.setVisibility(View.VISIBLE);
-                    break;
-                case NOT_RUNNING:
-                    mActionButton.setText(R.string.button_start);
-                    mActionButton.setVisibility(View.VISIBLE);
-                    mTriggerGlucoseButton.setVisibility(View.GONE);
-                    break;
-            }
-        } else {
-            mActionButton.setVisibility(View.GONE);
-            mTriggerGlucoseButton.setVisibility(View.GONE);
-        }
+                }
 
-        if (mIsFirstStartup && status == null) {
-            mStatusTextView.setText(R.string.status_message_first_startup);
-        } else {
-            mStatusTextView.setText(mService.getStatusString());
-            // TODO add layout item for battery instead of using append
-            if (mService.getBatteryLevel()>0) mStatusTextView.append(" Batt: " + mService.getBatteryLevel() + "%");
-            if (PreferencesUtil.shouldUseRoot(this) && status != null &&
-                    status.status == Type.ATTEMPTING && !status.hasRoot) {
-                mStatusTextView.append(" (no SuperSU)");
-            }
-            // simple indicator of root status, supersu root for wear is available at:
-            // http://forum.xda-developers.com/attachment.php?attachmentid=3342605&d=1433157678
-            // sha1: 00c2ccd6ff356fa5cf73124e978fc192af186d2d
-        }
+                if (mIsFirstStartup && status == null) {
+                    mStatusTextView.setText(R.string.status_message_first_startup);
+                } else {
 
-        updateAlarmSnoozeViews();
+                    if (mService == null) {
+                        mStatusTextView.append("\nService is not connected, don't try to change anything yet!");
+                    } else {
+                        mStatusTextView.setText(mService.getStatusString());
+                        // TODO add layout item for battery instead of using append
+                        if (mService.getBatteryLevel() > 0)
+                            mStatusTextView.append(" Batt: " + mService.getBatteryLevel() + "%");
+
+                        final String statsString = mService.getStatsString();
+                        if (statsString.length() > 0) mStatsTextView.setText(statsString);
+                    }
+
+                    if (PreferencesUtil.shouldUseRoot(context) && status != null &&
+                            status.status == Type.ATTEMPTING && !status.hasRoot) {
+                        mStatusTextView.append(" (no SuperSU)");
+                    }
+                    // simple indicator of root status, supersu root for wear is available at:
+                    // http://forum.xda-developers.com/attachment.php?attachmentid=3342605&d=1433157678
+                    // sha1: 00c2ccd6ff356fa5cf73124e978fc192af186d2d
+
+                }
+
+                updateAlarmSnoozeViews();
+            }
+        });
+
     }
 
     private void updateAlarmSnoozeViews() {
@@ -383,7 +484,7 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
         if (snoozeHigh > System.currentTimeMillis()) {
             mSnoozeHighParent.setVisibility(View.VISIBLE);
             mSnoozeHighTextView.setText(getString(R.string.alarm_disabled_high_text,
-                    AlgorithmUtil.format(new Date(snoozeHigh))));
+                    format(new Date(snoozeHigh))));
         } else {
             mSnoozeHighParent.setVisibility(View.GONE);
         }
@@ -393,7 +494,7 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
         if (snoozeLow > System.currentTimeMillis()) {
             mSnoozeLowParent.setVisibility(View.VISIBLE);
             mSnoozeLowTextView.setText(getString(R.string.alarm_disabled_low_text,
-                    AlgorithmUtil.format(new Date(snoozeLow))));
+                    format(new Date(snoozeLow))));
         } else {
             mSnoozeLowParent.setVisibility(View.GONE);
         }
@@ -406,16 +507,21 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
     }
 
     @Override
-    public void onAdapterItemClicked(PredictionData predictionData) {
-        String s = "";
-        boolean isMmol = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_mmol), true);
-        if (predictionData.glucoseLevel == -1) { // ERR
-            s = getString(R.string.err_explanation);
-        } else {
-            for (GlucoseData data : mService.getDatabase().getTrend(predictionData.phoneDatabaseId)) {
-                s += AlgorithmUtil.format(new Date(data.realDate)) + ": " + data.glucose(isMmol) + "\n";
+        public void onAdapterItemClicked(PredictionData predictionData) {
+            String s = "";
+
+            boolean isMmol = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_mmol), true);
+
+            if (predictionData.glucoseLevel == -1) { // ERR
+                s = getString(R.string.err_explanation);
+            } else {
+                for (GlucoseData data : mService.getDatabase().getTrend(predictionData.phoneDatabaseId)) {
+                    s += format(new Date(data.realDate)) + ": " + data.glucose(isMmol) + "\n";
+                }
+                if (predictionData.glucoseLevel == 0 || predictionData.glucoseLevel < 0 || predictionData.confidence > CONFIDENCE_LIMIT) { // Sensor ERR null // Sensor ERR negative // Sensor ERR TrendArrow
+                    s = getString(sensor_error);
+                }
             }
-        }
 
         AlertDialog dialog = new AlertDialog.Builder(this).setPositiveButton(android.R.string.ok, null)
                 .setTitle("").setMessage(s).create();
@@ -446,6 +552,9 @@ public class MainActivity extends Activity implements WearService.WearServiceLis
 
     @Override
     public void onQuickSettingsChanged(String key, String value) {
-        if (mService != null) mService.sendData(WearableApi.SETTINGS, key, value, null);
+        WearService.pushSettingsNow();
+        if (mService != null) {
+            mService.sendData(WearableApi.SETTINGS, key, value, null);
+        }
     }
 }
