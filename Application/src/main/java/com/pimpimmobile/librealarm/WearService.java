@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.IntentSender;
 import android.media.AudioManager;
@@ -13,9 +14,11 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.preference.PreferenceManager;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
+import android.support.annotation.NonNull;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -40,6 +43,8 @@ import com.pimpimmobile.librealarm.shareddata.WearableApi;
 import com.pimpimmobile.librealarm.xdrip_plus.XdripPlusBroadcast;
 
 import java.nio.charset.Charset;
+import java.text.Collator;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -50,7 +55,9 @@ import java.util.List;
 public class WearService extends Service implements DataApi.DataListener, MessageApi.MessageListener,
         GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener {
 
-    private static final String TAG = "GLUCOSE::" + WearService.class.getSimpleName();
+    private static final String TAG = "LibreAlarmService";
+
+    private static final long FAILOVER_TIMEOUT = 11 * 60 * 1000;
 
     private final WearServiceBinder binder = new WearServiceBinder();
 
@@ -68,7 +75,17 @@ public class WearService extends Service implements DataApi.DataListener, Messag
 
     private Status mReadingStatus;
 
-    private PredictionData mLastReading;
+    private static PredictionData mLastReading;
+
+    private static PendingIntent serviceFailoverIntent;
+
+    private static long failover_time;
+
+    private static ArrayList<String> essential_settings;
+
+    private static ArrayList<String> essential_string_settings;
+
+    private static boolean push_settings_now = false;
 
     private boolean mNotificationShowing = false;
 
@@ -93,53 +110,134 @@ public class WearService extends Service implements DataApi.DataListener, Messag
 
     }
 
-    @Override
-    public void onMessageReceived(MessageEvent messageEvent) {
-        String data = new String(messageEvent.getData(), Charset.forName("UTF-8"));
-        Log.i(TAG, "Message receiver: " + messageEvent.getPath() + ", " + data);
-        switch (messageEvent.getPath()) {
-            case WearableApi.CANCEL_ALARM:
-                stopAlarm();
-                break;
-            case WearableApi.SETTINGS:
-                Toast.makeText(this, R.string.settings_updated_on_watch, Toast.LENGTH_LONG).show();
-                HashMap<String, String> prefs = PreferencesUtil.toMap(data);
-                for (String key : prefs.keySet()) {
-                    PreferencesUtil.putString(this, key + QuickSettingsItem.WATCH_VALUE, prefs.get(key));
-                }
+    public static void pushSettingsNow() {
+        push_settings_now = true;
+    }
 
-                if (mListener != null) mListener.onWatchSettingsUpdated();
-                break;
-            case WearableApi.STATUS:
-                mReadingStatus = new Gson().fromJson(data, Status.class);
-                Status.Type type = mReadingStatus.status;
-                if (type == Status.Type.ALARM_HIGH || type == Status.Type.ALARM_LOW) {
-                    startAlarm(mReadingStatus);
-                } else {
-                    stopAlarm();
-                }
-                updateAlarmReceiver(type != Status.Type.NOT_RUNNING);
-                updateNotification(type != Status.Type.NOT_RUNNING);
-                if (mListener != null) mListener.onDataUpdated();
-                break;
-            case WearableApi.GLUCOSE:
-                ReadingData.TransferObject object =
-                        new Gson().fromJson(data, ReadingData.TransferObject.class);
-                if (mLastReading == null || mLastReading.realDate < object.data.prediction.realDate) {
-                    mLastReading = object.data.prediction;
-                    if (mAlarmReceiverIsRunning) AlarmReceiver.post(this);
-                    updateNotification((mReadingStatus.status == null ? null : mReadingStatus.status != Status.Type.NOT_RUNNING));
-                }
+    private static boolean shouldServiceRun() {
+        return true; // always on for now
+    }
 
-                mDatabase.storeReading(object.data);
-                WearableApi.sendMessage(mGoogleApiClient, WearableApi.GLUCOSE, String.valueOf(object.id), null);
-                if (mListener != null) mListener.onDataUpdated();
-                if (PreferencesUtil.isXdripPlusEnabled(this)) XdripPlusBroadcast.syncXdripPlus(getApplicationContext(),data,object,getBatteryLevel());
-                if (PreferencesUtil.isNsRestEnabled(this)) syncNightscout();
-                runTextToSpeech(object.data.prediction);
-                break;
+    public static void immortality(Context context, long period) {
+        if (JoH.ratelimit("immortality", 5)) {
+            if (period == 0) period = FAILOVER_TIMEOUT;
+            setFailoverTimer(context, period);
+            if (shouldServiceRun()) AlarmReceiver.post(libreAlarm.getAppContext());
         }
     }
+
+    public synchronized static void setFailoverTimer(Context context, long period) {
+        if (shouldServiceRun()) {
+            Log.d(TAG, "setFailoverTimer: Fallover Restarting in: " + (period / 60000 + " minutes"));
+            JoH.cancelAlarm(context, serviceFailoverIntent);
+            serviceFailoverIntent = PendingIntent.getService(context, 0, new Intent(context, WearService.class), 0);
+            failover_time = JoH.wakeUpIntent(libreAlarm.getAppContext(), period, serviceFailoverIntent);
+        }
+    }
+
+    private static ResultCallback<MessageApi.SendMessageResult> mMessageListener =
+            new ResultCallback<MessageApi.SendMessageResult>() {
+                @Override
+                public void onResult(@NonNull MessageApi.SendMessageResult sendMessageResult) {
+                    Log.e(TAG, "Message send result: " + sendMessageResult.getStatus().getStatusMessage());
+                    //  runOnUiThread(new Runnable() {
+                    //   @Override
+                    //    public void run() {
+                    //         Log.i(TAG, "messagesbeingsent: " + mMessagesBeingSent + ", finish? " + mFinishAfterSentMessages);
+                    //         if (--mMessagesBeingSent <= 0 && mFinishAfterSentMessages) {
+                    //             finish();
+                    //         }
+                    //         }
+                    //   });
+                }
+            };
+
+    @Override
+    public void onMessageReceived(final MessageEvent messageEvent) {
+        final PowerManager.WakeLock wl = JoH.getWakeLock("onMessageReceived", 60000);
+        final Context context = this;
+        JoH.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+
+
+                try {
+                    immortality(context, 0);
+                    String data = new String(messageEvent.getData(), Charset.forName("UTF-8"));
+                    Log.i(TAG, "Message receiver: " + messageEvent.getPath() + ", " + data);
+                    switch (messageEvent.getPath()) {
+                        case WearableApi.CANCEL_ALARM:
+                            stopAlarm();
+                            break;
+                        case WearableApi.SETTINGS:
+                            Toast.makeText(context, R.string.settings_updated_on_watch, Toast.LENGTH_LONG).show();
+                            HashMap<String, String> prefs = PreferencesUtil.toMap(data);
+                            for (String key : prefs.keySet()) {
+                                final String this_value = prefs.get(key);
+                                if (this_value.equals(PreferencesUtil.TRUE_MARKER) || this_value.equals(PreferencesUtil.FALSE_MARKER)) {
+                                    // its a boolean type ignore for now as none are sourced from the watch
+                                    //PreferencesUtil.putBoolean(context, key, this_value.equals(PreferencesUtil.TRUE_MARKER));
+                                } else {
+                                    PreferencesUtil.putString(context, key + QuickSettingsItem.WATCH_VALUE, prefs.get(key));
+                                }
+                            }
+
+                            if (mListener != null) mListener.onWatchSettingsUpdated();
+                            break;
+                        case WearableApi.STATUS:
+                            mReadingStatus = new Gson().fromJson(data, Status.class);
+                            Status.Type type = mReadingStatus.status;
+                            if (type == Status.Type.ALARM_HIGH || type == Status.Type.ALARM_LOW) {
+                                startAlarm(mReadingStatus);
+                            } else {
+                                stopAlarm();
+                            }
+                            updateAlarmReceiver(type != Status.Type.NOT_RUNNING);
+                            updateNotification(type != Status.Type.NOT_RUNNING);
+                            if (mListener != null) mListener.onDataUpdated();
+
+                            if (essential_settings != null) {
+                                if ((push_settings_now) || (JoH.ratelimit("push-settings", 86400))) {
+                                    push_settings_now = false;
+                                    Log.d(TAG, "Sending essential settings!");
+                                    final HashMap<String, String> map = new HashMap<>();
+                                    for (String key : essential_settings) {
+                                        map.put(key, PreferencesUtil.getBoolean(context, key, false) ? PreferencesUtil.TRUE_MARKER : PreferencesUtil.FALSE_MARKER);
+                                    }
+                                    for (String key : essential_string_settings) {
+                                        map.put(key, PreferencesUtil.getString(context, key, ""));
+                                    }
+                                    sendData(WearableApi.SETTINGS, map, null);
+                                }
+                            }
+                            break;
+                        case WearableApi.GLUCOSE:
+                            ReadingData.TransferObject object =
+                                    new Gson().fromJson(data, ReadingData.TransferObject.class);
+                            if (mLastReading == null || mLastReading.realDate < object.data.prediction.realDate) {
+                                mLastReading = object.data.prediction;
+                                if (mAlarmReceiverIsRunning) AlarmReceiver.post(context);
+                                if (mReadingStatus != null) {
+                                    updateNotification((mReadingStatus.status == null ? null : mReadingStatus.status != Status.Type.NOT_RUNNING));
+                                }
+                            }
+
+                            mDatabase.storeReading(object.data);
+                            WearableApi.sendMessage(mGoogleApiClient, WearableApi.GLUCOSE, String.valueOf(object.id), mMessageListener);
+                            if (mListener != null) mListener.onDataUpdated();
+                            if (PreferencesUtil.isXdripPlusEnabled(context))
+                                XdripPlusBroadcast.syncXdripPlus(getApplicationContext(), data, object, getBatteryLevel());
+                            if (PreferencesUtil.isNsRestEnabled(context)) syncNightscout();
+                            runTextToSpeech(object.data.prediction);
+                            break;
+                    }
+                } finally {
+                    JoH.releaseWakeLock(wl);
+                }
+            }
+        });
+    }
+
 
     private void updateAlarmReceiver(boolean started) {
         if (started && !mAlarmReceiverIsRunning) {
@@ -160,6 +258,7 @@ public class WearService extends Service implements DataApi.DataListener, Messag
             Notification.Builder builder = new Notification.Builder(this);
             builder.setSmallIcon(R.drawable.ic_launcher);
             Intent notificationIntent = new Intent(this, MainActivity.class);
+            String mLastReadingNull = new String("0");
 
             if (mLastReading != null) {
                 builder.setContentTitle("" + mLastReading.glucose(isMmol) + " " +
@@ -177,30 +276,48 @@ public class WearService extends Service implements DataApi.DataListener, Messag
         mNotificationShowing = show;
     }
 
-
     private void syncNightscout() {
         final List<PredictionData> data = mDatabase.getNsSyncData();
         new Thread() {
             @Override
             public void run() {
-                NightscoutUploader uploader = new NightscoutUploader(WearService.this);
-                List<PredictionData> result = uploader.upload(data);
-                mDatabase.setNsSynced(result);
-                super.run();
+                final PowerManager.WakeLock wl = JoH.getWakeLock("nightscout-up", 60000);
+                try {
+                    NightscoutUploader uploader = new NightscoutUploader(WearService.this);
+                    List<PredictionData> result = uploader.upload(data);
+                    mDatabase.setNsSynced(result);
+                    super.run();
+                } finally {
+                    JoH.releaseWakeLock(wl);
+                }
             }
         }.start();
     }
 
     public void start() {
-        WearableApi.sendMessage(mGoogleApiClient, WearableApi.START, "", null);
+        Log.e(TAG, "Starting everything");
+        WearableApi.sendMessage(mGoogleApiClient, WearableApi.START, "", mMessageListener);
+        PreferencesUtil.setIsStartedPhone(this, true);
     }
 
     public void stop() {
-        WearableApi.sendMessage(mGoogleApiClient, WearableApi.STOP, "", null);
+        Log.e(TAG, "Stopping everything");
+        WearableApi.sendMessage(mGoogleApiClient, WearableApi.STOP, "", mMessageListener);
+        PreferencesUtil.setIsStartedPhone(this, false);
+    }
+
+    public void reboot() {
+        Log.e(TAG, "Stopping everything");
+        WearableApi.sendMessage(mGoogleApiClient, WearableApi.REBOOT, "", mMessageListener);
+    }
+
+    public void clearstats() {
+        Log.e(TAG, "Stopping everything");
+        WearableApi.sendMessage(mGoogleApiClient, WearableApi.CLEAR_STATS, "", mMessageListener);
     }
 
     public void getUpdate() {
-        WearableApi.sendMessage(mGoogleApiClient, WearableApi.GET_UPDATE, "", null);
+        WearableApi.sendMessage(mGoogleApiClient, WearableApi.GET_UPDATE, "", mMessageListener);
     }
 
     public void disableAlarm(String key, int minutes) {
@@ -218,24 +335,96 @@ public class WearService extends Service implements DataApi.DataListener, Messag
     public void onCreate() {
         super.onCreate();
         setupTextToSpeech();
-        mGoogleApiClient = new GoogleApiClient.Builder(this)
-                .addApi(Wearable.API)
-                .addConnectionCallbacks(this)
-                .addOnConnectionFailedListener(this)
-                .build();
-        mGoogleApiClient.connect();
+        reconnectGoogleApi();
+        populateEssentialSettings();
+    }
+
+    private synchronized void populateEssentialSettings() {
+        if (essential_settings == null) {
+            essential_settings = new ArrayList<>();
+            essential_settings.add(getString(R.string.key_all_alarms_disabled));
+            essential_settings.add(getString(R.string.pref_key_root));
+            essential_settings.add(getString(R.string.pref_key_clock_speed));
+            essential_settings.add(getString(R.string.pref_key_disable_touchscreen));
+            essential_settings.add(getString(R.string.pref_key_switch_nfc));
+            essential_settings.add(getString(R.string.pref_key_switch_nfc_on_error));
+            essential_settings.add(getString(R.string.pref_key_uninstall_xdrip));
+            essential_settings.add(getString(R.string.pref_key_auto_theatre_mode));
+            essential_settings.add(getString(R.string.pref_key_auto_half_speed));
+
+            essential_string_settings = new ArrayList<>();
+            essential_string_settings.add(getString(R.string.pref_key_glucose_interval));
+            essential_string_settings.add(getString(R.string.pref_key_half_percent));
+        }
+    }
+
+    private void reconnectGoogleApi() {
+        if (JoH.ratelimit("reconnect-google", 15)) {
+            try {
+                if (!isConnected()) {
+                    Log.d(TAG, "Attempting to reconnect wear api");
+                    mGoogleApiClient.connect();
+                }
+            } catch (NullPointerException e) {
+                Log.d(TAG, "Creating new api connection");
+                mGoogleApiClient = new GoogleApiClient.Builder(this)
+                        .addApi(Wearable.API)
+                        .addConnectionCallbacks(this)
+                        .addOnConnectionFailedListener(this)
+                        .build();
+                mGoogleApiClient.connect();
+            }
+
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        Log.i(TAG, "onStartCommand!!!");
-        if (intent != null && "alarmreceiver".equals(intent.getAction()) &&
-                mReadingStatus != null && mReadingStatus.status != Status.Type.NOT_RUNNING) {
-            long delay = Integer.valueOf(PreferencesUtil.getCheckGlucoseInterval(this)) * 60000;
-            if (mLastReading == null || mLastReading.realDate + delay < System.currentTimeMillis()) {
-                Log.i(TAG, "trigger glucose");
-                sendMessage(WearableApi.TRIGGER_GLUCOSE, "", null);
+        final PowerManager.WakeLock wl = JoH.getWakeLock("WearStartCmd", 60000);
+        try {
+            Log.i(TAG, "onStartCommand!!! " + JoH.dateTimeText(JoH.tsl()));
+            if (!isConnected()) reconnectGoogleApi();
+            if (PreferencesUtil.getIsStartedPhone(this)) {
+                immortality(this, 0);
+                if (intent != null) {
+                    Log.d(TAG, "Intent: " + intent.getAction());
+                } else {
+                    Log.d(TAG, "Null intent");
+                }
+                if (mReadingStatus == null) {
+                    Log.d(TAG, "mReadingStatus is Null");
+                } else {
+                    Log.d(TAG, "mReadingStatus status: " + mReadingStatus.status);
+                }
+
+                if ((mReadingStatus == null) || (mReadingStatus.status == Status.Type.NOT_RUNNING)) {
+                    if (JoH.ratelimit("force-start", 600)) {
+                        Log.e(TAG, "Force starting service");
+                        start();
+                    }
+                }
+                // TODO check what if mReadingStatus == null
+                if (intent != null && "alarmreceiver".equals(intent.getAction())
+                        && PreferencesUtil.getIsStartedPhone(this)) {
+                    //  &&  mReadingStatus != null && mReadingStatus.status != Status.Type.NOT_RUNNING) {
+                    long delay = Integer.valueOf(PreferencesUtil.getCheckGlucoseInterval(this)) * 60000;
+                    if (mLastReading == null || mLastReading.realDate + delay < System.currentTimeMillis()) {
+                        if (JoH.ratelimit("trigger-glucose", 20)) {
+                            Log.i(TAG, "Trigger Glucose!");
+                            sendMessage(WearableApi.TRIGGER_GLUCOSE, "", mMessageListener);
+                        }
+                    } else {
+                        Log.d(TAG, "last reading was: " + JoH.msSince(mLastReading.realDate));
+                    }
+                }
+                reconnectGoogleApi();
+            } else {
+                Log.e(TAG, "Service is marked as stopped - shutting down");
+                stopSelf();
+                return START_NOT_STICKY;
             }
+        } finally {
+            JoH.releaseWakeLock(wl);
         }
 
         return START_STICKY;
@@ -243,19 +432,37 @@ public class WearService extends Service implements DataApi.DataListener, Messag
 
     @Override
     public void onDestroy() {
+        immortality(this, 0);
         if (!mResolvingError) {
-            Wearable.MessageApi.removeListener(mGoogleApiClient, this);
-            Wearable.DataApi.removeListener(mGoogleApiClient, this);
-            mGoogleApiClient.disconnect();
+            try {
+                Wearable.MessageApi.removeListener(mGoogleApiClient, this);
+                Wearable.DataApi.removeListener(mGoogleApiClient, this);
+                mGoogleApiClient.disconnect();
+            } catch (NullPointerException e) {
+                Log.e(TAG, "Got null pointer in onDestroy: " + e);
+            }
             stopAlarm();
         }
-        mTextToSpeech.shutdown();
-        mAlarmPlayer.release();
-        mDatabase.close();
+
+        try {
+            mTextToSpeech.shutdown();
+        } catch (NullPointerException e) {
+            //
+        }
+        try {
+            mAlarmPlayer.release();
+        } catch (NullPointerException e) {
+            //
+        }
+        try {
+            mDatabase.close();
+        } catch (NullPointerException e) {
+            //
+        }
         super.onDestroy();
     }
 
-    public boolean isConnected(){
+    public boolean isConnected() {
         return mGoogleApiClient != null && mGoogleApiClient.isConnected();
     }
 
@@ -325,7 +532,7 @@ public class WearService extends Service implements DataApi.DataListener, Messag
     }
 
     private void setupTextToSpeech() {
-        mTextToSpeech = new TextToSpeech(this,new TextToSpeech.OnInitListener() {
+        mTextToSpeech = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
             public void onInit(int status) {
                 if (status == TextToSpeech.ERROR) {
                     Toast.makeText(WearService.this, R.string.error_text_to_speech_init, Toast.LENGTH_LONG).show();
@@ -355,57 +562,64 @@ public class WearService extends Service implements DataApi.DataListener, Messag
 
     private void runTextToSpeech(PredictionData data) {
 
-        if (!PreferencesUtil.getBoolean(this, getString(R.string.pref_key_text_to_speech))) return;
+        final PowerManager.WakeLock wl = JoH.getWakeLock("tts", 30000);
+        try {
+            if (!PreferencesUtil.getBoolean(this, getString(R.string.pref_key_text_to_speech)))
+                return;
 
-        boolean alarmOnly = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_text_to_speech_only_alarm));
+            boolean alarmOnly = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_text_to_speech_only_alarm));
 
-        if (alarmOnly && AlertRules.checkDontPostpone(this, data) == AlertRules.Danger.NOTHING) return;
+            if (alarmOnly && AlertRules.checkDontPostpone(this, data) == AlertRules.Danger.NOTHING)
+                return;
 
-        AudioManager manager = (AudioManager) getSystemService(AUDIO_SERVICE);
-        manager.requestAudioFocus(mAudioFocusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+            AudioManager manager = (AudioManager) getSystemService(AUDIO_SERVICE);
+            manager.requestAudioFocus(mAudioFocusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
 
-        String message;
+            String message;
 
-        if (data.errorCode == PredictionData.Result.OK) {
-            boolean isMmol = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_mmol), true);
-            String glucose = data.glucose(isMmol);
+            if (data.errorCode == PredictionData.Result.OK) {
+                boolean isMmol = PreferencesUtil.getBoolean(this, getString(R.string.pref_key_mmol), true);
+                String glucose = data.glucose(isMmol);
 
-            AlgorithmUtil.TrendArrow arrow = AlgorithmUtil.getTrendArrow(data);
-            String trend;
-            switch (arrow) {
-                case UP:
-                    trend = getString(R.string.text_to_speech_trend_up);
-                    break;
-                case DOWN:
-                    trend = getString(R.string.text_to_speech_trend_down);
-                    break;
-                case SLIGHTLY_UP:
-                    trend = getString(R.string.text_to_speech_trend_slightly_up);
-                    break;
-                case SLIGHTLY_DOWN:
-                    trend = getString(R.string.text_to_speech_trend_slightly_down);
-                    break;
-                case FLAT:
-                    trend = getString(R.string.text_to_speech_trend_flat);
-                    break;
-                case UNKNOWN:
-                default:
-                    trend = getString(R.string.text_to_speech_trend_unknown);
-                    break;
+                AlgorithmUtil.TrendArrow arrow = AlgorithmUtil.getTrendArrow(data);
+                String trend;
+                switch (arrow) {
+                    case UP:
+                        trend = getString(R.string.text_to_speech_trend_up);
+                        break;
+                    case DOWN:
+                        trend = getString(R.string.text_to_speech_trend_down);
+                        break;
+                    case SLIGHTLY_UP:
+                        trend = getString(R.string.text_to_speech_trend_slightly_up);
+                        break;
+                    case SLIGHTLY_DOWN:
+                        trend = getString(R.string.text_to_speech_trend_slightly_down);
+                        break;
+                    case FLAT:
+                        trend = getString(R.string.text_to_speech_trend_flat);
+                        break;
+                    case UNKNOWN:
+                    default:
+                        trend = getString(R.string.text_to_speech_trend_unknown);
+                        break;
+                }
+                message = getString(R.string.text_to_speech_message, glucose, trend);
+            } else {
+                message = getString(R.string.text_to_speech_error);
             }
-            message = getString(R.string.text_to_speech_message, glucose, trend);
-        } else {
-            message = getString(R.string.text_to_speech_error);
-        }
 
-        if (Build.VERSION.SDK_INT < 21) {
-            HashMap<String, String> map = new HashMap<>();
-            map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "glucose-speech");
-            mTextToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, map);
-        } else {
-            mTextToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, "glucose-speech");
-        }
+            if (Build.VERSION.SDK_INT < 21) {
+                HashMap<String, String> map = new HashMap<>();
+                map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "glucose-speech");
+                mTextToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, map);
+            } else {
+                mTextToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, "glucose-speech");
+            }
 
+        } finally {
+            JoH.releaseWakeLock(wl);
+        }
     }
 
     public int getBatteryLevel() {
@@ -415,6 +629,19 @@ public class WearService extends Service implements DataApi.DataListener, Messag
             return 0;
         }
     }
+
+    public String getStatsString() {
+        try {
+            if ((mReadingStatus != null) && (mReadingStatus.successes > -1)) {
+                return getString(R.string.stats_successes) + " " + mReadingStatus.successes + " " + getString(R.string.stats_failures) + " " + mReadingStatus.failures + " " + getString(R.string.stats_successes_rate) + " " + JoH.qs(((double)(mReadingStatus.successes - mReadingStatus.failures)) / mReadingStatus.successes * 100, 1)+ "%";
+            } else {
+                return "";
+            }
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
 
     public String getStatusString() {
         if (isConnected() && mReadingStatus != null) {
@@ -435,7 +662,18 @@ public class WearService extends Service implements DataApi.DataListener, Messag
                     return "";
             }
         } else {
-            return "Not connected";
+            if (!isConnected()) {
+                if (JoH.ratelimit("poll-update", 15)) {
+                    getUpdate();
+                    JoH.runOnUiThreadDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if ((MainActivity.activityVisible) && (!isConnected())) getUpdate();
+                        }
+                    }, 16000);
+                }
+            }
+            return isConnected() ? getString(R.string.not_connected) : getString(R.string.wear_not_connected);
         }
     }
 
@@ -448,7 +686,12 @@ public class WearService extends Service implements DataApi.DataListener, Messag
     }
 
     public void sendMessage(String command, String message, ResultCallback<MessageApi.SendMessageResult> listener) {
-        if (isConnected()) WearableApi.sendMessage(mGoogleApiClient, command, message, listener);
+        if (isConnected()) {
+            WearableApi.sendMessage(mGoogleApiClient, command, message, listener);
+        } else {
+            Log.e(TAG, "Google api not connected");
+            reconnectGoogleApi();
+        }
     }
 
     public void setListener(Activity activity, WearServiceListener listener) {
@@ -458,6 +701,7 @@ public class WearService extends Service implements DataApi.DataListener, Messag
 
     public interface WearServiceListener {
         void onDataUpdated();
+
         void onWatchSettingsUpdated();
     }
 }
