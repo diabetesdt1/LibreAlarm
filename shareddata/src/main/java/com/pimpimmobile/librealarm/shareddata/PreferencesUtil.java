@@ -2,6 +2,7 @@ package com.pimpimmobile.librealarm.shareddata;
 
 import android.content.Context;
 import android.preference.PreferenceManager;
+import android.util.Log;
 
 import com.google.gson.JsonObject;
 
@@ -12,6 +13,13 @@ import java.util.HashMap;
 import java.util.Iterator;
 
 public class PreferencesUtil {
+
+    public static final String TRUE_MARKER = "___TRUE___";
+    public static final String FALSE_MARKER = "___FALSE___";
+
+    private static final String TAG = "LibrePrefUtil";
+
+    public static int battery_threshold = -1;
 
     // Used on phone
     public static Boolean isNsRestEnabled(Context context) {
@@ -35,6 +43,15 @@ public class PreferencesUtil {
 
     public static boolean getIsStarted(Context context) {
         return getBoolean(context, "startstopflag");
+    }
+
+    // Used on phone
+    public static void setIsStartedPhone(Context context, boolean started) {
+        setBoolean(context, "phone-startstopflag", started);
+    }
+
+    public static boolean getIsStartedPhone(Context context) {
+        return getBoolean(context, "phone-startstopflag", true);
     }
 
     public static void setRetries(Context context, int attempts) {
@@ -86,12 +103,62 @@ public class PreferencesUtil {
         return getBoolean(context, context.getString(R.string.pref_key_disable_touchscreen), false);
     }
 
+    public static Boolean toggleNFC(Context context) {
+        return getBoolean(context, context.getString(R.string.pref_key_switch_nfc), false);
+    }
+
+    public static Boolean toggleNFConError(Context context) {
+        return getBoolean(context, context.getString(R.string.pref_key_switch_nfc_on_error), true);
+    }
+
+    public static Boolean automaticallyEnableTheatreMode(Context context) {
+        return getBoolean(context, context.getString(R.string.pref_key_auto_theatre_mode), false);
+    }
+
+    public static Boolean useHalfSpeed(Context context) {
+        return getBoolean(context, context.getString(R.string.pref_key_auto_half_speed), false);
+    }
+
+    public static Boolean uninstallxDrip(Context context) {
+        return getBoolean(context, context.getString(R.string.pref_key_uninstall_xdrip), false);
+    }
+
     public static String getCheckGlucoseInterval(Context context) {
-        return getString(context, context.getString(R.string.pref_key_glucose_interval), "10");
+        return getString(context, context.getString(R.string.pref_key_glucose_interval), "5");
+    }
+
+    public static String getHalfThreshold(Context context) {
+        return getString(context, context.getString(R.string.pref_key_half_percent), "30");
+    }
+
+    public static int getHalfThresholdNumber(Context context) {
+        final String val = getHalfThreshold(context);
+        try {
+            final int value = Integer.parseInt(val);
+            if (value < 2 || value > 90) return 30;
+            return value;
+        } catch (Exception e) {
+            return 30;
+        }
+    }
+
+    public static void updateBatteryThresholdCache(Context context) {
+        battery_threshold = getHalfThresholdNumber(context);
     }
 
     public static Boolean shouldUseRoot(Context context) {
         return getBoolean(context, context.getString(R.string.pref_key_root));
+    }
+
+    public static boolean shouldGoHalfSpeed(Context context, int battery_level) {
+        if (battery_threshold < 1) {
+            battery_threshold = getHalfThresholdNumber(context);
+        }
+        if ((battery_level < 1) || (battery_level > battery_threshold)) {
+            return false;
+        } else {
+            return useHalfSpeed(context);
+        }
     }
 
     /// / End used in watch
@@ -155,6 +222,10 @@ public class PreferencesUtil {
 
     public static void putString(Context context, String key, String value) {
         PreferenceManager.getDefaultSharedPreferences(context).edit().putString(key, value).apply();
+    }
+
+    public static void putBoolean(Context context, String key, boolean value) {
+        PreferenceManager.getDefaultSharedPreferences(context).edit().putBoolean(key, value).apply();
     }
 
     public static float getFloat(Context context, int id) {
